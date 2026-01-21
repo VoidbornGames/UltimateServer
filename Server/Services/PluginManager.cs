@@ -69,7 +69,7 @@ namespace UltimateServer.Services
         /// <summary>
         /// Loads a plugin from a specific DLL file.
         /// </summary>
-        private async Task LoadPluginFromFileAsync(string dllFile, string tempDir)
+        public async Task LoadPluginFromFileAsync(string dllFile, string tempDir)
         {
             try
             {
@@ -229,6 +229,21 @@ namespace UltimateServer.Services
             catch { }
 
             _logger.Log("🔌 All plugins unloaded.");
+        }
+
+        /// <summary>
+        /// Unloads all loaded plugins and loads them again.
+        /// </summary>
+        public async Task ReloadAllPluginsAsync()
+        {
+            _logger.Log("🔄 Reloading plugins via Plugin Manger request...");
+            await UnloadAllPluginsAsync();
+
+            _logger.Log("⏳ Waiting for file locks to be released...");
+            await Task.Delay(1000);
+
+            await LoadPluginsAsync();
+            _logger.Log("✅ Plugin reload complete.");
         }
 
         /// <summary>

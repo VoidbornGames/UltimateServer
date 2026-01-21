@@ -31,7 +31,8 @@ class VoiceClient : IDisposable
         LeaveChannel = 4,
         RoomList = 5,
         ChannelList = 6,
-        ServerMessage = 7
+        ServerMessage = 7,
+        PacketData = 8
     }
 
     public VoiceClient(string serverIp, int port)

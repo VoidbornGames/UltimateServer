@@ -32,13 +32,12 @@ namespace UltimateServer.Services
             _backupPath = configManager.Config.BackupFolder;
             _backupSites = configManager.Config.BackupSites;
 
-            _serverFiles.Add(filePaths.UsersFile);
             _serverFiles.Add(filePaths.ConfigFile);
-            _serverFiles.Add(sitePress.sitesConfig);
             _serverFiles.Add(dataBox._options.SaveFile);
             _serverFiles.Add(configManager.Config.MiniDB_Options.IndexFile);
             _serverFiles.Add(configManager.Config.MiniDB_Options.DatabaseFile);
             _serverFiles.Add("sftp.json");
+            _serverFiles.Add("data.db");
 
             foreach (var file in Directory.GetFiles("logs"))
             {

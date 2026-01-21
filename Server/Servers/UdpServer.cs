@@ -196,16 +196,16 @@ namespace UltimateServer.Servers
                 return;
             }
 
+            if (data.Length > _maxPacketSize)
+            {
+                _logger.Log($"❌ Failed to handle client data. Removing client {sender}. Max packet size exeeded!");
+                RemoveClient(sender);
+                return;
+            }
+
+
             foreach (var clientEndpoint in channel.Clients.Keys)
             {
-                if (clientEndpoint.Equals(sender))
-                    if (data.Length > _maxPacketSize)
-                    {
-                        _logger.Log($"❌ Failed to handle client data. Removing client {clientEndpoint}. Max packet size exeeded!");
-                        RemoveClient(clientEndpoint);
-                        continue;
-                    }
-
                 if (!clientEndpoint.Equals(sender))
                 {
                     try

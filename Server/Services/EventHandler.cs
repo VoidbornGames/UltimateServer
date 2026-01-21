@@ -8,7 +8,8 @@ namespace UltimateServer.Services
     /// </summary>
     public class EventHandler : 
         IEventHandler<UserRegisteredEvent>,
-        IEventHandler<VideoUploadedEvent>
+        IEventHandler<VideoUploadedEvent>,
+        IEventHandler<PluginLoadedEvent>
     {
         private readonly Logger _logger;
 
@@ -31,6 +32,11 @@ namespace UltimateServer.Services
             {
                 _logger.Log($"🎬 Notification: Video '{eventData.FileName}' from URL '{eventData.SourceUrl}' has been uploaded and is ready for processing.");
             });
+        }
+
+        public async Task HandleAsync(PluginLoadedEvent eventData)
+        {
+
         }
     }
 }

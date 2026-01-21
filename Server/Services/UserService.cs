@@ -1,6 +1,5 @@
-﻿using Microsoft.Extensions.DependencyInjection;
-using Newtonsoft.Json;
-using Org.BouncyCastle.Crypto.Agreement.Kdf;
+﻿using Newtonsoft.Json;
+using Server.Services;
 using UltimateServer.Events;
 using UltimateServer.Models;
 
@@ -10,28 +9,25 @@ namespace UltimateServer.Services
     {
         private readonly AuthenticationService _authService;
         private readonly ValidationService _validationService;
+        private readonly FeatherDatabase _featherDatabase;
         private readonly CacheService _cacheService;
         private readonly EmailService _emailService;
         private readonly ServerConfig _serverConfig;
         private readonly Logger _logger;
+        public long usersCount;
 
-        private readonly object _userLock = new();
         private readonly IEventBus _eventBus;
-        private readonly string _usersFile;
-
-        public List<User> Users { get; private set; }
 
         public UserService(
-            FilePaths filePaths,
             Logger logger,
             AuthenticationService authService,
             ValidationService validationService,
             CacheService cacheService,
             IEventBus eventBus,
             EmailService emailService,
-            ConfigManager configManager)
+            ConfigManager configManager,
+            FeatherDatabase featherDatabase)
         {
-            _usersFile = filePaths.UsersFile;
             _logger = logger;
             _authService = authService;
             _validationService = validationService;
@@ -39,67 +35,41 @@ namespace UltimateServer.Services
             _eventBus = eventBus;
             _emailService = emailService;
             _serverConfig = configManager.Config;
-            Users = new List<User>();
+            _featherDatabase = featherDatabase;
+
+            _featherDatabase.CreateTable<User>();
+
+            MigrateFromJsonToFeatherDatabase();
+            usersCount = _featherDatabase.GetAll<User>().Count;
         }
 
-        public async Task LoadUsersAsync()
+        private void MigrateFromJsonToFeatherDatabase()
         {
-            try
+            if (File.Exists("users.json"))
             {
-                var cachedUsers = _cacheService.Get<List<User>>("users");
-                if (cachedUsers != null)
-                {
-                    Users = cachedUsers;
-                    _logger.Log("✅ Users loaded from cache.");
-                    return;
-                }
+                var jsonUsers = JsonConvert.DeserializeObject<List<User>>(File.ReadAllText("users.json"));
 
-                if (File.Exists(_usersFile))
-                {
-                    string json = await File.ReadAllTextAsync(_usersFile);
-                    Users = JsonConvert.DeserializeObject<List<User>>(json) ?? new List<User>();
-                }
-                else
-                {
-                    Users = new List<User>();
-                    Users.Add(new User
-                    {
-                        Username = "admin",
-                        Password = _authService.HashPassword("admin123"),
-                        Email = "admin@example.com",
-                        uuid = Guid.NewGuid(),
-                        Role = "admin"
-                    });
-                    await SaveUsersAsync();
-                    _logger.Log("✅ Created default admin user (username: admin, password: admin123)");
-                }
+                foreach (var user in jsonUsers)
+                    _featherDatabase.SaveData(user);
 
-                _cacheService.Set("users", Users, TimeSpan.FromMinutes(30));
-                _logger.Log($"✅ Loaded {Users.Count} users.");
+                File.Move("users.json", "users_old_json_save.json");
+                jsonUsers = null;
             }
-            catch (Exception ex)
+            else if (_featherDatabase.GetByColumn<User>("Username", "admin") == null)
             {
-                _logger.LogError($"Error loading users: {ex.Message}");
-                Users = new List<User>();
+                var adminUser = new User
+                {
+                    Username = "admin",
+                    Password = _authService.HashPassword("admin123"),
+                    Email = "admin@example.com",
+                    uuid = Guid.NewGuid(),
+                    Role = "admin"
+                };
+                _featherDatabase.SaveData(adminUser);
+                _logger.Log("✅ Created default admin user (username: admin, password: admin123)");
             }
         }
 
-        public async Task SaveUsersAsync()
-        {
-            try
-            {
-                string json = JsonConvert.SerializeObject(Users, Formatting.Indented);
-                await File.WriteAllTextAsync(_usersFile, json);
-
-                _cacheService.Set("users", Users, TimeSpan.FromMinutes(30));
-
-                // _logger.Log("💾 Users saved.");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError($"Error saving users: {ex.Message}");
-            }
-        }
 
         public async Task<(User user, string message)> CreateUserAsync(RegisterRequest request)
         {
@@ -109,41 +79,34 @@ namespace UltimateServer.Services
                 return (null, string.Join(", ", errors));
             }
 
-            if (Users.Any(u => u.Username.Equals(request.Username, StringComparison.OrdinalIgnoreCase)))
+            if (_featherDatabase.GetByColumn<User>("Username", request.Username) != null)
             {
                 return (null, "Username already exists");
             }
 
-            if (Users.Any(u => u.Email.Equals(request.Email, StringComparison.OrdinalIgnoreCase)))
+            if (_featherDatabase.GetByColumn<User>("Email", request.Email) != null)
             {
                 return (null, "Email already exists");
             }
 
-            lock (_userLock)
+            var newUser = new User
             {
-                var newUser = new User
-                {
-                    Username = request.Username,
-                    Password = _authService.HashPassword(request.Password),
-                    Email = request.Email,
-                    uuid = Guid.NewGuid(),
-                    Role = "user",
-                    RefreshToken = _authService.GenerateRefreshToken(),
-                    RefreshTokenExpiry = DateTime.UtcNow.AddDays(7)
-                };
-                Users.Add(newUser);
-            }
+                Username = request.Username,
+                Password = _authService.HashPassword(request.Password),
+                Email = request.Email,
+                uuid = Guid.NewGuid(),
+                Role = "user",
+                RefreshToken = _authService.GenerateRefreshToken(),
+                RefreshTokenExpiry = DateTime.UtcNow.AddDays(7)
+            };
 
-            await SaveUsersAsync();
-            var createdUser = Users.FirstOrDefault(u => u.Username == request.Username);
+            _featherDatabase.SaveData(newUser);
+
             _logger.Log($"✅ User created: {request.Username}");
+            await _eventBus.PublishAsync(new UserRegisteredEvent(newUser));
 
-            if (createdUser != null)
-            {
-                await _eventBus.PublishAsync(new UserRegisteredEvent(createdUser));
-            }
-
-            return (createdUser, "User created successfully");
+            usersCount++;
+            return (newUser, "User created successfully");
         }
 
         public async Task<(User user, string message)> AuthenticateUserAsync(LoginRequest request)
@@ -153,7 +116,7 @@ namespace UltimateServer.Services
                 return (null, "Account is temporarily locked due to multiple failed login attempts");
             }
 
-            var user = Users.FirstOrDefault(u => u.Username.Equals(request.Username, StringComparison.OrdinalIgnoreCase));
+            var user = _featherDatabase.GetByColumn<User>("Username", request.Username);
 
             if (user == null)
             {
@@ -173,7 +136,7 @@ namespace UltimateServer.Services
                     user.RefreshTokenExpiry = DateTime.UtcNow.AddDays(7);
                 }
 
-                await SaveUsersAsync();
+                _featherDatabase.SaveData(user);
                 _logger.Log($"✅ User authenticated: {user.Username}");
                 return (user, "Authentication successful");
             }
@@ -186,7 +149,7 @@ namespace UltimateServer.Services
 
         public async Task<(User user, string message)> RefreshTokenAsync(RefreshTokenRequest request)
         {
-            var user = Users.FirstOrDefault(u => u.RefreshToken == request.RefreshToken);
+            var user = _featherDatabase.GetByColumn<User>("RefreshToken", request.RefreshToken);
 
             if (user == null)
             {
@@ -201,14 +164,14 @@ namespace UltimateServer.Services
             user.RefreshToken = _authService.GenerateRefreshToken();
             user.RefreshTokenExpiry = DateTime.UtcNow.AddDays(7);
 
-            await SaveUsersAsync();
+            _featherDatabase.SaveData(user);
             _logger.Log($"✅ Token refreshed for user: {user.Username}");
             return (user, "Token refreshed successfully");
         }
 
         public async Task<(bool success, string message)> ChangePasswordAsync(string username, string currentPassword, string newPassword)
         {
-            var user = Users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+            var user = _featherDatabase.GetByColumn<User>("Username", username);
 
             if (user == null)
             {
@@ -226,7 +189,7 @@ namespace UltimateServer.Services
             }
 
             user.Password = _authService.HashPassword(newPassword);
-            await SaveUsersAsync();
+            _featherDatabase.SaveData(user);
 
             _logger.Log($"✅ Password changed for user: {username}");
             return (true, "Password changed successfully");
@@ -234,19 +197,18 @@ namespace UltimateServer.Services
 
         public async Task<(bool success, string message)> ResetPasswordAsync(string email)
         {
-            var user = Users.FirstOrDefault(u => u.Email.Equals(email, StringComparison.OrdinalIgnoreCase));
+            var user = _featherDatabase.GetByColumn<User>("Email", email);
 
             if (user == null)
             {
-                return (true, "If the email exists, a password reset link has been sent.");
+                return (true, "If that email exists, a password reset link has been sent.");
             }
 
             var resetToken = _authService.GenerateResetToken();
-
             user.PasswordResetToken = resetToken;
             user.PasswordResetTokenExpiry = DateTime.UtcNow.AddHours(1);
 
-            // await _context.SaveChangesAsync();
+            _featherDatabase.SaveData(user);
 
             var resetLink = $"https://{_serverConfig.PanelDomain}/reset-password?token={Uri.EscapeDataString(resetToken)}&email={Uri.EscapeDataString(user.Email)}";
 
@@ -259,66 +221,64 @@ namespace UltimateServer.Services
 
             _logger.LogSecurity($"🔑 Password reset token for {user.Email} is: {resetToken}");
 
-            return (true, "If the email exists, a password reset link has been sent.");
+            return (true, "If that email exists, a password reset link has been sent.");
         }
 
         public async Task<(bool success, string message)> ConfirmPasswordResetAsync(ChangePasswordRequest request)
         {
-            var user = Users.FirstOrDefault(u =>
-            u.Email.Equals(request.Email, StringComparison.OrdinalIgnoreCase) &&
-            u.PasswordResetToken.Equals(request.Token, StringComparison.OrdinalIgnoreCase)
-            );
-            if (user == null)
+            var user = _featherDatabase.GetByColumn<User>("Email", request.Email);
+
+            if (user == null || !user.PasswordResetToken.Equals(request.Token, StringComparison.OrdinalIgnoreCase))
             {
                 return (false, "Invalid email or reset token.");
             }
+
             if (!_authService.ValidatePasswordResetToken(user, request.Token))
             {
                 return (false, "Invalid or expired reset token.");
             }
+
             if (!_validationService.IsStrongPassword(request.NewPassword))
             {
                 return (false, "New password does not meet security requirements.");
             }
-            string newPasswordHash = _authService.HashPassword(request.NewPassword);
-            user.Password = newPasswordHash;
+
+            user.Password = _authService.HashPassword(request.NewPassword);
             user.PasswordResetToken = null;
-            user.PasswordResetTokenExpiry = DateTime.MinValue; 
-                                                            
-            await SaveUsersAsync();
+            user.PasswordResetTokenExpiry = DateTime.MinValue;
+
+            _featherDatabase.SaveData(user);
             _logger.Log($"✅ Password reset successfully for user: {user.Email}");
             return (true, "Your password has been reset successfully. You can now log in.");
         }
 
         public async Task<(bool success, string message)> UpdateUserProfileAsync(string username, User updatedUser)
         {
-            var user = Users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+            var user = _featherDatabase.GetByColumn<User>("Username", username);
 
             if (user == null)
             {
                 return (false, "User not found");
             }
 
-            if (!string.IsNullOrEmpty(updatedUser.Email) &&
-                updatedUser.Email != user.Email &&
-                Users.Any(u => u.Email.Equals(updatedUser.Email, StringComparison.OrdinalIgnoreCase)))
+            if (!string.IsNullOrEmpty(updatedUser.Email) && updatedUser.Email != user.Email)
             {
-                return (false, "Email already exists");
-            }
-
-            if (!string.IsNullOrEmpty(updatedUser.Email))
-            {
+                var owner = _featherDatabase.GetByColumn<User>("Email", updatedUser.Email);
+                if (owner != null && owner.Id != user.Id)
+                {
+                    return (false, "Email already exists");
+                }
                 user.Email = updatedUser.Email;
             }
 
-            await SaveUsersAsync();
+            _featherDatabase.SaveData(user);
             _logger.Log($"✅ Profile updated for user: {username}");
             return (true, "Profile updated successfully");
         }
 
         public async Task<(bool success, string message)> DeleteUserAsync(string username)
         {
-            var user = Users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+            var user = _featherDatabase.GetByColumn<User>("Username", username);
 
             if (user == null)
             {
@@ -330,34 +290,33 @@ namespace UltimateServer.Services
                 return (false, "Cannot delete admin user");
             }
 
-            lock (_userLock)
-            {
-                Users.Remove(user);
-            }
+            _featherDatabase.Delete<User>(user.Id);
 
-            await SaveUsersAsync();
+            usersCount--;
             _logger.Log($"✅ User deleted: {username}");
             return (true, "User deleted successfully");
         }
 
+        // Helper Methods for Lookups
+
         public User GetUserByUsername(string username)
         {
-            return Users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+            return _featherDatabase.GetByColumn<User>("Username", username);
         }
 
         public User GetUserByEmail(string email)
         {
-            return Users.FirstOrDefault(u => u.Email.Equals(email, StringComparison.OrdinalIgnoreCase));
+            return _featherDatabase.GetByColumn<User>("Email", email);
         }
 
         public User GetUserByUuid(Guid uuid)
         {
-            return Users.FirstOrDefault(u => u.uuid == uuid);
+            return _featherDatabase.GetByColumn<User>("uuid", uuid);
         }
 
         public async Task<(bool success, string message)> LogoutAsync(string username)
         {
-            var user = Users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+            var user = _featherDatabase.GetByColumn<User>("Username", username);
 
             if (user == null)
             {
@@ -366,15 +325,15 @@ namespace UltimateServer.Services
 
             user.RefreshToken = "";
             user.RefreshTokenExpiry = DateTime.UtcNow;
+            _featherDatabase.SaveData(user);
 
-            await SaveUsersAsync();
             _logger.Log($"✅ User logged out: {username}");
             return (true, "Logout successful");
         }
 
         public async Task<(bool success, string message)> EnableTwoFactorAsync(string username)
         {
-            var user = Users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+            var user = _featherDatabase.GetByColumn<User>("Username", username);
 
             if (user == null)
             {
@@ -383,15 +342,15 @@ namespace UltimateServer.Services
 
             user.TwoFactorSecret = Guid.NewGuid().ToString();
             user.TwoFactorEnabled = true;
+            _featherDatabase.SaveData(user);
 
-            await SaveUsersAsync();
             _logger.Log($"✅ 2FA enabled for user: {username}");
             return (true, "Two-factor authentication enabled");
         }
 
         public async Task<(bool success, string message)> DisableTwoFactorAsync(string username)
         {
-            var user = Users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+            var user = _featherDatabase.GetByColumn<User>("Username", username);
 
             if (user == null)
             {
@@ -400,15 +359,15 @@ namespace UltimateServer.Services
 
             user.TwoFactorEnabled = false;
             user.TwoFactorSecret = "";
+            _featherDatabase.SaveData(user);
 
-            await SaveUsersAsync();
             _logger.Log($"✅ 2FA disabled for user: {username}");
             return (true, "Two-factor authentication disabled");
         }
 
         public async Task<(bool success, string message)> VerifyTwoFactorAsync(string username, string code)
         {
-            var user = Users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+            var user = _featherDatabase.GetByColumn<User>("Username", username);
 
             if (user == null)
             {
@@ -431,12 +390,12 @@ namespace UltimateServer.Services
 
         public List<User> GetUsersByRole(string role)
         {
-            return Users.Where(u => u.Role.Equals(role, StringComparison.OrdinalIgnoreCase)).ToList();
+            return _featherDatabase.GetListByColumn<User>("Role", role);
         }
 
         public async Task<(bool success, string message)> ChangeUserRoleAsync(string username, string newRole)
         {
-            var user = Users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+            var user = _featherDatabase.GetByColumn<User>("Username", username);
 
             if (user == null)
             {
@@ -445,15 +404,15 @@ namespace UltimateServer.Services
 
             if (user.Role == "admin" && newRole != "admin")
             {
-                var adminCount = Users.Count(u => u.Role == "admin");
-                if (adminCount <= 1)
+                var admins = _featherDatabase.GetListByColumn<User>("Role", "admin");
+                if (admins.Count <= 1)
                 {
                     return (false, "Cannot change role of the last admin user");
                 }
             }
 
             user.Role = newRole;
-            await SaveUsersAsync();
+            _featherDatabase.SaveData(user);
 
             _logger.Log($"✅ Role changed for user {username} to {newRole}");
             return (true, "Role changed successfully");
@@ -461,7 +420,7 @@ namespace UltimateServer.Services
 
         public async Task<(bool success, string message)> LockUserAsync(string username, int lockDurationMinutes = 30)
         {
-            var user = Users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+            var user = _featherDatabase.GetByColumn<User>("Username", username);
 
             if (user == null)
             {
@@ -469,7 +428,7 @@ namespace UltimateServer.Services
             }
 
             user.LockedUntil = DateTime.UtcNow.AddMinutes(lockDurationMinutes);
-            await SaveUsersAsync();
+            _featherDatabase.SaveData(user);
 
             _logger.Log($"🔒 User locked: {username} until {user.LockedUntil}");
             return (true, $"User locked for {lockDurationMinutes} minutes");
@@ -477,7 +436,7 @@ namespace UltimateServer.Services
 
         public async Task<(bool success, string message)> UnlockUserAsync(string username)
         {
-            var user = Users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+            var user = _featherDatabase.GetByColumn<User>("Username", username);
 
             if (user == null)
             {
@@ -488,8 +447,7 @@ namespace UltimateServer.Services
             user.FailedLoginAttempts = 0;
 
             _authService.ResetFailedLoginAttempts(username);
-
-            await SaveUsersAsync();
+            _featherDatabase.SaveData(user);
 
             _logger.Log($"🔓 User unlocked: {username}");
             return (true, "User unlocked successfully");

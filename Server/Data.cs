@@ -8,13 +8,13 @@ namespace UltimateServer.Models
     public class Data
     {
         public int protocolVersion { get; set; } = 1;
-        public string userName { get; set; } = "";
-        public string encryptedPassword { get; set; } = "";
+        //public string userName { get; set; } = "";
+        //public string encryptedPassword { get; set; } = "";
         public string theCommand { get; set; } = "";
         public string jsonData { get; set; } = "";
     }
 
-    public class User
+    public class User : FeatherData
     {
         public string Username { get; set; } = "";
         public string Password { get; set; } = "";
@@ -30,6 +30,11 @@ namespace UltimateServer.Models
         public DateTime RefreshTokenExpiry { get; set; } = DateTime.UtcNow.AddDays(7);
         public string PasswordResetToken { get; set; }
         public DateTime PasswordResetTokenExpiry { get; set; }
+    }
+
+    public class FeatherData
+    {
+        public int Id { get; set; }
     }
 
     public class ServerConfig

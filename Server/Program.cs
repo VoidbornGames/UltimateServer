@@ -1,10 +1,9 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
-using UltimateServer;
 using UltimateServer.Servers;
 using UltimateServer.Services;
 using UltimateServer.Events;
 using UltimateServer.Models;
-using UltimateServer.Services;
+using Server.Services;
 
 namespace UltimateServer
 {
@@ -19,9 +18,13 @@ namespace UltimateServer
 
         static async Task Main(string[] args)
         {
-            // Stating the app with args if you want custop ports to use:
-            // dotnet Server.dll 11001 11002 11003 11004
-            //             args: arg-1 arg-2 arg-3 arg-4
+            // Stating the app with args if you want custom ports to use:
+            // Start Command:  ./Server 11001 11002 11003 11004 
+            //                    args: arg-1 arg-2 arg-3 arg-4
+
+            // Use the Default command for building the project so there will be no need of DotNet to run the app!
+            // Default build command: dotnet publish -c Release -r linux-x64 --self-contained true -p:PublishTrimmed=true -p:TrimMode=partial -p:InvariantGlobalization=true -p:DebugType=None -p:DebugSymbols=false -p:EnableDiagnostics=false -p:PublishReadyToRun=false -p:TieredCompilation=false -p:EventSourceSupport=false -p:PublishSingleFile=true -p:IncludeAllContentForSelfExtract=false
+
 
             if (args.Length > 0 && int.TryParse(args[0], out int parsedPort))
                 tcpPort = parsedPort;
@@ -39,6 +42,7 @@ namespace UltimateServer
             services.AddSingleton(provider => provider.GetRequiredService<ConfigManager>().Config);
             services.AddSingleton<FilePaths>();
             services.AddSingleton(provider => new ServerSettings { tcpPort = tcpPort, httpPort = httpPort, udpPort = udpPort, sftpPort = sftpPort });
+            services.AddSingleton<FeatherDatabase>();
             services.AddSingleton<CacheService>();
             services.AddSingleton<IEventBus, InMemoryEventBus>();
             services.AddSingleton<Services.EventHandler>();
@@ -53,9 +57,10 @@ namespace UltimateServer
             services.AddSingleton<HttpServer>();
             services.AddSingleton<TcpServer>();
             services.AddSingleton<UdpServer>();
+            
 
 
-            services.AddScoped<AuthenticationService>(provider =>
+            services.AddScoped(provider =>
                 new AuthenticationService(
                     JwtSecret,
                     provider.GetRequiredService<ServerConfig>(),
@@ -65,6 +70,7 @@ namespace UltimateServer
             services.AddScoped<VideoService>();
             services.AddScoped<CommandHandler>();
             services.AddScoped<Nginx>();
+            services.AddScoped<PackageManager>();
 
             var serviceProvider = services.BuildServiceProvider();
 
@@ -76,6 +82,7 @@ namespace UltimateServer
 
             eventBus.Subscribe<UserRegisteredEvent>(eventHandler);
             eventBus.Subscribe<VideoUploadedEvent>(eventHandler);
+            eventBus.Subscribe<PluginLoadedEvent>(eventHandler);
 
 
             var userService = serviceProvider.GetRequiredService<UserService>();
@@ -95,8 +102,6 @@ namespace UltimateServer
             await miniDB.Start();
             await dataBox.Start();
 
-            await userService.LoadUsersAsync();
-
             await httpServer.Start();
             await tcpServer.Start();
             await udpServer.Start();
@@ -105,7 +110,8 @@ namespace UltimateServer
             await dataBackuper.Start();
             await webSocketServer.Start();
 
-            Directory.Delete(Path.Combine("plugins", ".plugin_temp"), true);
+            if (Directory.Exists(Path.Combine("plugins", ".plugin_temp")))
+                Directory.Delete(Path.Combine("plugins", ".plugin_temp"), true);
             pluginManager._serviceProvider = serviceProvider;
             await pluginManager.LoadPluginsAsync();
 
@@ -114,11 +120,6 @@ namespace UltimateServer
                 while (!cts.Token.IsCancellationRequested)
                 {
                     await Task.Delay(TimeSpan.FromMinutes(5), cts.Token);
-
-                    await userService.SaveUsersAsync();
-                    await sitePress.SaveSites();
-                    await sftpServer.Save();
-
                     await dataBox.Save();
                 }
             });
@@ -150,25 +151,18 @@ namespace UltimateServer
                 cts.Cancel();
                 logger.Log("🛑 Shutdown requested...");
 
-                logger.Log("💾 Saving final data...");
-                var userService = serviceProvider.GetRequiredService<UserService>();
-                await userService.SaveUsersAsync();
-
-                var sitePress = serviceProvider.GetRequiredService<SitePress>();
-                await sitePress.SaveSites();
-
-                var sftpServer = serviceProvider.GetRequiredService<SftpServer>();
-                await sftpServer.Save();
-
                 logger.Log("🛑 Stopping servers...");
                 var httpServer = serviceProvider.GetRequiredService<HttpServer>();
                 var tcpServer = serviceProvider.GetRequiredService<TcpServer>();
                 var udpServer = serviceProvider.GetRequiredService<UdpServer>();
+                var pluginManager = serviceProvider.GetRequiredService<PluginManager>();
                 var sitePressService = serviceProvider.GetRequiredService<SitePress>();
                 var sftpServerService = serviceProvider.GetRequiredService<SftpServer>();
                 var webSocketServer = serviceProvider.GetRequiredService<WebSocketServer>();
                 var dataBox = serviceProvider.GetRequiredService<DataBox>();
                 var miniDB = serviceProvider.GetRequiredService<MiniDB>();
+
+                await pluginManager.UnloadAllPluginsAsync();
 
                 await httpServer.StopAsync();
                 await tcpServer.StopAsync();
@@ -181,10 +175,8 @@ namespace UltimateServer
                 await miniDB.Stop();
 
                 logger.Log("✅ Shutdown complete.");
+                Environment.Exit(0);
             }
-
-            // Use the Default command for building the project so there will be no need of DotNet to run the app!
-            // Default build command: dotnet publish -c Release -r linux-x64 --self-contained true -p:PublishTrimmed=true -p:TrimMode=partial -p:InvariantGlobalization=true -p:DebugType=None -p:DebugSymbols=false -p:EnableDiagnostics=false -p:PublishReadyToRun=false -p:TieredCompilation=false -p:EventSourceSupport=false -p:PublishSingleFile=true -p:IncludeAllContentForSelfExtract=false
 
             await Task.Delay(Timeout.Infinite);
         }

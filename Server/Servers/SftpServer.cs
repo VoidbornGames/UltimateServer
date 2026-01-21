@@ -1,5 +1,7 @@
 ﻿using Newtonsoft.Json;
+using Server.Services;
 using System.Collections.Concurrent;
+using System.Linq;
 using System.Net;
 using System.Text;
 using UltimateServer.Models;
@@ -15,9 +17,16 @@ namespace UltimateServer.Services
         private UserService _userService;
         private ServerConfig _serverConfig;
         private AuthenticationService _authenticationService;
+        private readonly FeatherDatabase _featherDatabase;
 
-        public Dictionary<string, string> usersFolders = new();
+        public ConcurrentDictionary<string, string> usersFolders = new();
 
+
+        public class SftpMapping : FeatherData
+        {
+            public string Username { get; set; }
+            public string FolderPath { get; set; }
+        }
 
         public SftpServer(
             ServerSettings settings,
@@ -26,7 +35,8 @@ namespace UltimateServer.Services
             UserService userService,
             ConfigManager configManager,
             ServerSettings serverSettings,
-            AuthenticationService authenticationService)
+            AuthenticationService authenticationService,
+            FeatherDatabase featherDatabase)
         {
             _port = serverSettings.sftpPort;
             _logger = logger;
@@ -34,6 +44,9 @@ namespace UltimateServer.Services
             _cts = new CancellationTokenSource();
             _userService = userService;
             _serverConfig = configManager.Config;
+            _featherDatabase = featherDatabase;
+
+            _featherDatabase.CreateTable<SftpMapping>();
         }
 
         internal static readonly string RootFolder = "/var/www/";
@@ -41,14 +54,23 @@ namespace UltimateServer.Services
 
         public async Task Start()
         {
-            if (File.Exists("sftp.json"))
-                await Load();
+            var mappings = _featherDatabase.GetAll<SftpMapping>();
+
+            if (mappings.Any())
+            {
+                usersFolders = new ConcurrentDictionary<string, string>(
+                    mappings.ToDictionary(x => x.Username, x => x.FolderPath)
+                );
+                _logger.Log($"✅ Loaded {mappings.Count} SFTP mappings from database.");
+            }
             else
-                usersFolders = new Dictionary<string, string>();
+            {
+                usersFolders = new ConcurrentDictionary<string, string>();
+            }
 
             try
             {
-                if(!Directory.Exists(RootFolder)) Directory.CreateDirectory(RootFolder);
+                if (!Directory.Exists(RootFolder)) Directory.CreateDirectory(RootFolder);
                 _httpListener = new HttpListener();
                 string prefix = $"http://*:{_port}/";
                 _httpListener.Prefixes.Add(prefix);
@@ -56,7 +78,11 @@ namespace UltimateServer.Services
                 _logger.Log($"🗃️ SFTP Panel Running on {prefix}");
 
                 if (!usersFolders.ContainsKey("admin"))
-                    usersFolders.Add("admin", "/");
+                {
+                    var adminMapping = new SftpMapping { Username = "admin", FolderPath = "/" };
+                    _featherDatabase.SaveData(adminMapping);
+                    usersFolders["admin"] = "/";
+                }
 
                 _ = Task.Run(async () =>
                 {
@@ -92,7 +118,6 @@ namespace UltimateServer.Services
 
         public async Task StopAsync()
         {
-            await Save();
             _cts.Cancel();
             _httpListener?.Stop();
             _httpListener?.Close();
@@ -100,26 +125,6 @@ namespace UltimateServer.Services
             await Task.CompletedTask;
         }
 
-        public async Task Save()
-        {
-            var credentials = new sftpData
-            {
-                _usersSites = usersFolders
-            };
-
-            var data = JsonConvert.SerializeObject(credentials, Formatting.Indented);
-            await File.WriteAllTextAsync("sftp.json", data);
-        }
-        public async Task Load()
-        {
-            var data = JsonConvert.DeserializeObject<sftpData>(await File.ReadAllTextAsync("sftp.json"));
-            usersFolders = data._usersSites;
-        }
-
-        struct sftpData
-        {
-            public Dictionary<string, string> _usersSites;
-        }
 
         private async Task HandleRequestAsync(HttpListenerContext context)
         {
@@ -408,7 +413,7 @@ namespace UltimateServer.Services
                 }
 
                 await File.WriteAllTextAsync(fullPath, content);
-                if(_serverConfig.DebugMode) _logger.Log($"✅ File saved by user: {Path.GetFileName(fullPath)}");
+                if (_serverConfig.DebugMode) _logger.Log($"✅ File saved by user: {Path.GetFileName(fullPath)}");
 
                 await WriteJsonResponseAsync(response, new { success = true, message = "File saved successfully." });
             }
@@ -439,8 +444,8 @@ namespace UltimateServer.Services
                     loginRequest.TryGetValue("Username", out var username) &&
                     loginRequest.TryGetValue("Password", out var password))
                 {
-                    var _user = _userService.Users.FirstOrDefault(u => u.Username == username, new User() { Username = "Invalid User" });
-                    if(_user.Username == "Invalid User")
+                    var _user = _userService.GetUserByUsername(username);
+                    if (_user == null || string.IsNullOrWhiteSpace(_user.Username))
                     {
                         response.StatusCode = 401;
                         await WriteJsonResponseAsync(response, new { success = false, message = "Invalid credentials" });
@@ -455,11 +460,18 @@ namespace UltimateServer.Services
                     }
 
 
-                    if (_authenticationService.VerifyPassword(password, _user.Password) && _user.Role == "sftp user" || _user.Role == "admin")
+                    if (_authenticationService.VerifyPassword(password, _user.Password) && _user.Role == "sftp user" || _authenticationService.VerifyPassword(password, _user.Password) && _user.Role == "admin")
                     {
                         _authenticationService.ResetFailedLoginAttempts(_user.Username);
                         var token = Guid.NewGuid().ToString("N");
                         Sessions[token] = (DateTime.UtcNow.AddHours(2), username);
+
+                        if (!usersFolders.ContainsKey(username))
+                        {
+                            var newMapping = new SftpMapping { Username = username, FolderPath = username };
+                            _featherDatabase.SaveData(newMapping);
+                            usersFolders[username] = username;
+                        }
 
                         var userPathSuffix = usersFolders.GetValueOrDefault(username, username);
                         var userRootPath = Path.GetFullPath(Path.Combine(RootFolder, userPathSuffix));
@@ -670,7 +682,6 @@ namespace UltimateServer.Services
         {
             try
             {
-                usersFolders.Add(username, username);
                 var newUser = new User
                 {
                     Username = username,
@@ -681,21 +692,42 @@ namespace UltimateServer.Services
                     RefreshToken = _authenticationService.GenerateRefreshToken(),
                     RefreshTokenExpiry = DateTime.UtcNow.AddDays(7)
                 };
-                _userService.Users.Add(newUser);
+                _featherDatabase.SaveData(newUser);
+
+                var mapping = new SftpMapping { Username = username, FolderPath = username };
+                _featherDatabase.SaveData(mapping);
+
+                usersFolders[username] = username;
+
+                var path = Path.GetFullPath(Path.Combine(RootFolder, username));
+                Directory.CreateDirectory(path);
+
+                _logger.Log($"✅ SFTP User Created: {username}");
             }
             catch (Exception e)
             {
                 _logger.LogError($"Error creating SFTP user: {e.Message}");
             }
         }
+
         public async Task DeleteUser(string username)
         {
             try
             {
-                usersFolders.Remove(username);
+                var mapping = _featherDatabase.GetByColumn<SftpMapping>("Username", username);
+                if (mapping != null)
+                {
+                    _featherDatabase.Delete<SftpMapping>(mapping.Id);
+                }
+
+                usersFolders.TryRemove(username, out _);
+
+                var path = Path.GetFullPath(Path.Combine(RootFolder, username));
+                if (Directory.Exists(path)) Directory.Delete(path, true);
+
                 await _userService.DeleteUserAsync(username);
             }
-            catch(Exception e)
+            catch (Exception e)
             {
                 _logger.LogError($"Error deleting SFTP user: {e.Message}");
             }
@@ -776,7 +808,7 @@ namespace UltimateServer.Services
 
         private async Task ServeDefaultPageAsync(HttpListenerRequest request, HttpListenerResponse response)
         {
-            string htmlPath = Path.Combine(AppContext.BaseDirectory, "sftp.html");
+            string htmlPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "sftp.html");
             if (File.Exists(htmlPath))
             {
                 string html = await File.ReadAllTextAsync(htmlPath);

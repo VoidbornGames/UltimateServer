@@ -1,12 +1,14 @@
-﻿using Microsoft.Extensions.DependencyInjection;
+﻿using HttpMultipartParser;
+using Microsoft.Extensions.DependencyInjection;
 using Newtonsoft.Json;
-using UltimateServer.Services;
+using Server.Services;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using UltimateServer.Models;
+using UltimateServer.Services;
 
 namespace UltimateServer.Servers
 {
@@ -20,15 +22,20 @@ namespace UltimateServer.Servers
         private readonly VideoService _videoService;
         private readonly CompressionService _compressionService;
         private readonly PluginManager _pluginManager;
+        private readonly PackageManager _packageManager;
         private readonly ConfigManager _configManager;
         private readonly DownloadJobProcessor _downloadJobProcessor;
         private readonly DDoSProtectionService _ddosProtection;
+        private readonly FeatherDatabase _featherDatabase;
         private readonly IServiceProvider _serviceProvider;
         private HttpListener _httpListener;
         private CancellationTokenSource _cts;
         private double _lastCpuUsage = 0;
         private readonly ConcurrentDictionary<TcpClient, bool> _activeClients = new();
         private bool useCompression = false;
+        private string panelWebPage;
+        private long activeConnections;
+        private long activePlugins;
 
         public HttpServer(
             ServerSettings settings,
@@ -38,7 +45,9 @@ namespace UltimateServer.Servers
             VideoService videoService,
             PluginManager pluginManager,
             IServiceProvider serviceProvider,
-            ConfigManager configManager)
+            ConfigManager configManager,
+            PackageManager packageManager,
+            FeatherDatabase featherDatabase)
         {
             _port = settings.httpPort;
             _ip = settings.Ip;
@@ -53,7 +62,9 @@ namespace UltimateServer.Servers
             _cts = new CancellationTokenSource();
             _configManager = configManager;
             useCompression = configManager.Config.EnableCompression;
-            _downloadJobProcessor = new DownloadJobProcessor(_logger, _pluginManager);
+            _downloadJobProcessor = new DownloadJobProcessor(_logger, _pluginManager, packageManager);
+            _packageManager = packageManager;
+            _featherDatabase = featherDatabase;
 
             _ddosProtection = new DDoSProtectionService(
                 logger,
@@ -67,6 +78,36 @@ namespace UltimateServer.Servers
 
         public async Task Start()
         {
+            _ = Task.Run(async () =>
+            {
+                while (true)
+                {
+                    string htmlPath = Path.Combine(AppContext.BaseDirectory, "index.html");
+                    string cssPath = Path.Combine(AppContext.BaseDirectory, "style.css");
+                    string jsPath = Path.Combine(AppContext.BaseDirectory, "script.js");
+
+                    if (File.Exists(htmlPath))
+                    {
+                        string webPage = await File.ReadAllTextAsync(htmlPath);
+
+                        if (File.Exists(cssPath))
+                        {
+                            string css = await File.ReadAllTextAsync(cssPath);
+                            string styledHtml = webPage.Replace("</head>", $"<style>\n{css}\n</style>\n</head>");
+                            webPage = styledHtml;
+                        }
+                        if (File.Exists(jsPath))
+                        {
+                            string js = await File.ReadAllTextAsync(jsPath);
+                            string funcedHtml = webPage.Replace("</body>", $"<script>\n{js}\n</script>\n</body>");
+                            webPage = funcedHtml;
+                        }
+                        panelWebPage = webPage;
+                    }
+                    await Task.Delay(5000);
+                }
+            });
+
             try
             {
                 _httpListener = new HttpListener();
@@ -77,7 +118,7 @@ namespace UltimateServer.Servers
                 _httpListener.Start();
                 _logger.Log($"🌐 HTTP server listening on {prefix}");
 
-                var activeConnections = 0;
+                activeConnections = 0;
                 var maxConnections = _configManager.Config.MaxConnections;
 
                 _ = Task.Run(async () =>
@@ -398,7 +439,11 @@ namespace UltimateServer.Servers
             {
                 try
                 {
-                    var sites = _serviceProvider.GetRequiredService<SitePress>().sites;
+                    var sites = new Dictionary<string, int>();
+
+                    foreach(var site in _serviceProvider.GetRequiredService<SitePress>().sites)
+                        sites.Add(site.Key, site.Value);
+
                     await WriteJsonResponseAsync(response, sites);
                 }
                 catch (Exception ex)
@@ -735,21 +780,35 @@ namespace UltimateServer.Servers
 
                 tempFilePath = Path.Combine(pluginsDirectory, $"{filename}.tmp");
                 finalFilePath = Path.Combine(pluginsDirectory, filename);
-                await File.WriteAllBytesAsync(tempFilePath, fileContent);
-                _logger.Log($"✅ Plugin temporarily saved to '{tempFilePath}'");
-
-                _logger.Log("🔄 Unloading existing plugins before replacement...");
-                await _pluginManager.UnloadAllPluginsAsync();
-
-                if (File.Exists(finalFilePath))
+                if(Path.GetExtension(filename) == ".dll")
                 {
-                    File.Delete(finalFilePath);
-                }
-                File.Move(tempFilePath, finalFilePath);
-                _logger.Log($"✅ Replaced old plugin with '{finalFilePath}'");
-                tempFilePath = null;
+                    await File.WriteAllBytesAsync(tempFilePath, fileContent);
+                    _logger.Log($"✅ Plugin temporarily saved to '{tempFilePath}'");
 
-                await _pluginManager.LoadPluginsAsync();
+                    _logger.Log("🔄 Unloading existing plugins before replacement...");
+                    await _pluginManager.UnloadAllPluginsAsync();
+
+                    if (File.Exists(finalFilePath))
+                    {
+                        File.Delete(finalFilePath);
+                    }
+                    File.Move(tempFilePath, finalFilePath);
+                    _logger.Log($"✅ Replaced old plugin with '{finalFilePath}'");
+                    tempFilePath = null;
+
+                    await _pluginManager.LoadPluginsAsync();
+                }
+                else if(Path.GetExtension(filename) == ".pkg")
+                {
+                    var package = await _packageManager.GetPackageFromByteArray(fileContent);
+                    if (package != null)
+                        await _packageManager.InstallPackage(package);
+                    else
+                    {
+                        await WriteJsonResponseAsync(response, new { success = false, message = "Invalid content type" });
+                        return;
+                    }
+                }
 
                 _logger.Log("✅ Plugin upload and reload complete.");
                 await WriteJsonResponseAsync(response, new { success = true, message = "Plugin uploaded and reloaded successfully." });
@@ -1066,7 +1125,7 @@ namespace UltimateServer.Servers
             var stats = new
             {
                 uptime = (DateTime.Now - Process.GetCurrentProcess().StartTime).ToString(@"hh\:mm\:ss"),
-                users = _userService.Users.Count,
+                users = _userService.usersCount,
                 maxConnections = _configManager.Config.MaxConnections,
                 protocol = 1
             };
@@ -1103,7 +1162,19 @@ namespace UltimateServer.Servers
                         totalBytesReceived += nicStats.BytesReceived;
                     }
 
-                    systemStats = new { cpuUsage = cpuUse, memoryMB = memUsage, diskUsedGB = usedSpace / (1024.0 * 1024 * 1024), diskTotalGB = totalSpace / (1024.0 * 1024 * 1024), netSentMB = totalBytesSent / (1024.0 * 1024), netReceivedMB = totalBytesReceived / (1024.0 * 1024) };
+                    activePlugins = _pluginManager.GetLoadedPlugins().Count;
+
+                    systemStats = new
+                    {
+                        cpuUsage = cpuUse,
+                        memoryMB = memUsage,
+                        diskUsedGB = usedSpace / (1024.0 * 1024 * 1024),
+                        diskTotalGB = totalSpace / (1024.0 * 1024 * 1024),
+                        netSentMB = totalBytesSent / (1024.0 * 1024),
+                        netReceivedMB = totalBytesReceived / (1024.0 * 1024),
+                        activeConnections = activeConnections,
+                        activePlugins = activePlugins
+                    };
                 }
                 catch { systemStats = new { cpuUsage = cpuUse, memoryMB = memUsage }; }
             }
@@ -1118,7 +1189,7 @@ namespace UltimateServer.Servers
         private async Task HandleLogsAsync(HttpListenerRequest request, HttpListenerResponse response)
         {
             string logFile = Path.Combine(AppContext.BaseDirectory, "logs", "latest.log");
-            string[] lines = File.Exists(logFile) ? File.ReadLines(logFile).Reverse().Take(50).Reverse().ToArray() : Array.Empty<string>();
+            string[] lines = File.Exists(logFile) ? File.ReadLines(logFile).Reverse().Take(200).Reverse().ToArray() : Array.Empty<string>();
             await WriteJsonResponseAsync(response, lines);
         }
 
@@ -1243,28 +1314,9 @@ namespace UltimateServer.Servers
 
         private async Task ServeDefaultPageAsync(HttpListenerRequest request, HttpListenerResponse response)
         {
-            string htmlPath = Path.Combine(AppContext.BaseDirectory, "index.html");
-            string cssPath = Path.Combine(AppContext.BaseDirectory, "style.css");
-            string jsPath = Path.Combine(AppContext.BaseDirectory, "script.js");
-
-            if (File.Exists(htmlPath))
+            if (!string.IsNullOrWhiteSpace(panelWebPage))
             {
-                string html = await File.ReadAllTextAsync(htmlPath);
-
-                if (File.Exists(cssPath))
-                {
-                    string css = await File.ReadAllTextAsync(cssPath);
-                    string styledHtml = html.Replace("</head>", $"<style>\n{css}\n</style>\n</head>");
-                    html = styledHtml;
-                }
-                if (File.Exists(cssPath))
-                {
-                    string js = await File.ReadAllTextAsync(jsPath);
-                    string funcedHtml = html.Replace("</body>", $"<script>\n{js}\n</script>\n</body>");
-                    html = funcedHtml;
-                }
-
-                byte[] buffer = Encoding.UTF8.GetBytes(html);
+                byte[] buffer = Encoding.UTF8.GetBytes(panelWebPage);
                 response.ContentType = "text/html";
                 response.ContentLength64 = buffer.Length;
                 await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
@@ -1313,6 +1365,7 @@ namespace UltimateServer.Servers
         public string Name { get; set; } = "plugin";
         public string Description { get; set; } = "description";
         public string DownloadLink { get; set; } = "";
+        public bool isPackaged = false;
     }
 
     public class DownloadJobProcessor
@@ -1321,13 +1374,15 @@ namespace UltimateServer.Servers
         private readonly SemaphoreSlim _signal = new SemaphoreSlim(0);
         private readonly Logger _logger;
         private readonly PluginManager _pluginManager;
+        private readonly PackageManager _packageManager;
         private readonly CancellationTokenSource _cancellationTokenSource = new CancellationTokenSource();
         private Task _processingTask;
 
-        public DownloadJobProcessor(Logger logger, PluginManager pluginManager)
+        public DownloadJobProcessor(Logger logger, PluginManager pluginManager, PackageManager packageManager)
         {
             _logger = logger;
             _pluginManager = pluginManager;
+            _packageManager = packageManager;
             _processingTask = Task.Run(ProcessJobsAsync);
         }
 
@@ -1371,36 +1426,54 @@ namespace UltimateServer.Servers
 
         private async Task ProcessDownloadJobAsync(MarketPlugin downloadRequest)
         {
-            string pluginsDirectory = Path.Combine(AppContext.BaseDirectory, "plugins");
-            string fileName = $"{downloadRequest.Name}.dll";
-            string filePath = Path.Combine(pluginsDirectory, fileName);
-
-            Directory.CreateDirectory(pluginsDirectory);
-
-            using var client = new HttpClient();
-            var downloadResponse = await client.GetAsync(downloadRequest.DownloadLink, HttpCompletionOption.ResponseHeadersRead, _cancellationTokenSource.Token);
-
-            if (!downloadResponse.IsSuccessStatusCode)
+            if(downloadRequest.isPackaged == false)
             {
-                _logger.LogError($"Failed to download file from URL: {downloadRequest.DownloadLink}. Status: {downloadResponse.StatusCode}");
-                return;
-            }
+                string pluginsDirectory = Path.Combine(AppContext.BaseDirectory, "plugins");
+                string fileName = $"{downloadRequest.Name}.dll";
+                string filePath = Path.Combine(pluginsDirectory, fileName);
 
-            using (var contentStream = await downloadResponse.Content.ReadAsStreamAsync())
-            using (var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None))
+                Directory.CreateDirectory(pluginsDirectory);
+
+                using var client = new HttpClient();
+                var downloadResponse = await client.GetAsync(downloadRequest.DownloadLink, HttpCompletionOption.ResponseHeadersRead, _cancellationTokenSource.Token);
+
+                if (!downloadResponse.IsSuccessStatusCode)
+                {
+                    _logger.LogError($"Failed to download file from URL: {downloadRequest.DownloadLink}. Status: {downloadResponse.StatusCode}");
+                    return;
+                }
+
+                using (var contentStream = await downloadResponse.Content.ReadAsStreamAsync())
+                using (var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    await contentStream.CopyToAsync(fileStream, _cancellationTokenSource.Token);
+                }
+
+                _logger.Log($"Successfully downloaded and saved plugin to: {filePath}");
+                await _pluginManager.ReloadAllPluginsAsync();
+            }
+            else
             {
-                await contentStream.CopyToAsync(fileStream, _cancellationTokenSource.Token);
+                string pluginsDirectory = Path.Combine(AppContext.BaseDirectory, "plugins");
+                Directory.CreateDirectory(pluginsDirectory);
+
+                using var client = new HttpClient();
+                var downloadResponse = await client.GetAsync(downloadRequest.DownloadLink, HttpCompletionOption.ResponseHeadersRead, _cancellationTokenSource.Token);
+
+                if (!downloadResponse.IsSuccessStatusCode)
+                {
+                    _logger.LogError($"Failed to download file from URL: {downloadRequest.DownloadLink}. Status: {downloadResponse.StatusCode}");
+                    return;
+                }
+
+                var content = await downloadResponse.Content.ReadAsByteArrayAsync();
+                var package = await _packageManager.GetPackageFromByteArray(content);
+
+                if (package != null)
+                    await _packageManager.InstallPackage(package);
+                else
+                    _logger.LogError($"Can't Install Packaged Plugin: '{downloadRequest.Name}' From '{downloadRequest.DownloadLink}'");
             }
-
-            _logger.Log($"Successfully downloaded and saved plugin to: {filePath}");
-            _logger.Log("🔄 Reloading plugins via Marketplace request...");
-
-            await _pluginManager.UnloadAllPluginsAsync();
-
-            _logger.Log("⏳ Waiting for file locks to be released...");
-            await Task.Delay(1000, _cancellationTokenSource.Token);
-
-            await _pluginManager.LoadPluginsAsync();
         }
 
         public async Task StopAsync()

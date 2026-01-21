@@ -25,10 +25,8 @@ namespace UltimateServer.Services
         private void RegisterCommands()
         {
             AddCommand("createUser", CreateUserCommand);
-            AddCommand("listUsers", ListUsersCommand);
             AddCommand("say", SayCommand);
             AddCommand("makeUUID", MakeUUIDCommand);
-            AddCommand("stats", StatsCommand);
         }
 
         private Data CreateUserCommand(Data req)
@@ -59,13 +57,6 @@ namespace UltimateServer.Services
             }
         }
 
-        private Data ListUsersCommand(Data req)
-        {
-            string usersJson = JsonConvert.SerializeObject(_userService.Users);
-            _logger.Log("📄 Sent user list.");
-            return new Data { protocolVersion = 1, theCommand = "listUsers", jsonData = usersJson };
-        }
-
         private Data SayCommand(Data req)
         {
             _logger.Log($"🗨️ Client says: {req.jsonData}");
@@ -79,26 +70,15 @@ namespace UltimateServer.Services
             return new Data { protocolVersion = 1, theCommand = "uuid", jsonData = JsonConvert.SerializeObject(uuid) };
         }
 
-        private Data StatsCommand(Data req)
-        {
-            var stats = new
-            {
-                uptime = (DateTime.Now - Process.GetCurrentProcess().StartTime).ToString(),
-                users = _userService.Users.Count,
-                protocol = 1
-            };
-            return new Data { protocolVersion = 1, theCommand = "stats", jsonData = JsonConvert.SerializeObject(stats) };
-        }
-
         private void AddCommand(string name, Func<Data, Data> handler) => _commandHandlers[name] = handler;
 
         public bool TryHandleCommand(Data request, out Data response)
         {
-            if (!ValidateRequester(request.userName, request.encryptedPassword))
+            /*if (!ValidateRequester(request.userName, request.encryptedPassword))
             {
                 response = new() { theCommand = "Invalid User" };
                 return false;
-            }
+            }*/
 
             response = null;
             if (_commandHandlers.TryGetValue(request.theCommand, out var handler))
@@ -109,7 +89,7 @@ namespace UltimateServer.Services
             return false;
         }
 
-        /// <summary>
+        /*/// <summary>
         /// Validates if the requester is a valid user and its password is correct.
         /// </summary>
         public bool ValidateRequester(string username, string encryptedPassword)
@@ -123,9 +103,9 @@ namespace UltimateServer.Services
                 return true;
             else
                 return false;
-        }
+        }*/
 
-        /// <summary>
+        /*/// <summary>
         /// Decrypts an encrypted password using the uuid of that user
         /// </summary>
         public string GetTheDecryptedPassword(string encryptedPassword, string uuid)
@@ -144,7 +124,7 @@ namespace UltimateServer.Services
             {
                 return null;
             }
-        }
+        }*/
     }
 }
 
