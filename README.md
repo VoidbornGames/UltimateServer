@@ -1,6 +1,6 @@
 # UltimateServer
 
-![Version](https://img.shields.io/badge/version-7.13.7-blue) ![Coverage](https://img.shields.io/badge/coverage-95%25-blue)
+![Version](https://img.shields.io/badge/version-8.13.10-blue) ![Coverage](https://img.shields.io/badge/coverage-95%25-blue)
 
 A powerful, multi-purpose C# server built with a modern, service-oriented architecture. Features real-time dashboard, robust user management, a dynamic plugin system, secure video streaming, Single Click Site Creation, and real-time voice chat capabilities. Designed for game servers, monitoring systems, and real-time applications.
 
